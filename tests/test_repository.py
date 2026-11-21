@@ -11,9 +11,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parent))
-from debbuild import build_deb  # noqa: E402
+from debbuild import build_deb, make_data_tar  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from app import deb as debmod  # noqa: E402
 from app import storage  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
@@ -456,7 +457,7 @@ def test_crash_before_rename_is_aborted_on_restart(tmp_path):
     # The repository still accepts new publications afterwards.
     ok = make_batch(tmp_path / "ok", "1.0.0")
     (tmp_path / "ok").mkdir(exist_ok=True)
-    publication = resumed.publish(
+    publication, _reused = resumed.publish(
         [StagedUpload(path=p, original_name=p.name) for p in ok]
     )
     assert publication.state == "committed"
@@ -664,3 +665,368 @@ def test_head_matches_get_for_repository_files(client):
         assert head.content == b""
         assert head.headers["content-length"] == str(len(get.content))
         assert head.headers["etag"] == get.headers["etag"]
+
+
+# ---------------------------------------------------------------------------
+# Data archive validation cache: only Depends/Version changed, same data.tar
+# ---------------------------------------------------------------------------
+
+def _shared_data_deb(path: Path, *, package: str, version: str, depends: str | None,
+                     data_tar: bytes) -> Path:
+    control = {"Package": package, "Version": version}
+    if depends is not None:
+        control["Depends"] = depends
+    return build_deb(path, control=control, data_tar=data_tar)
+
+
+def test_same_data_archive_skips_revalidation_and_response_lists_it(client, monkeypatch):
+    test_client, settings = client
+    src = settings.data_dir.parent / "src"
+    data_tar = make_data_tar()
+
+    calls = {"count": 0}
+    original_validate = debmod._validate_payload
+
+    def counting_validate(*args, **kwargs):
+        calls["count"] += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(debmod, "_validate_payload", counting_validate)
+
+    # First publication: full validation, nothing reusable yet.
+    first = src / "relint_1.0.0_amd64.deb"
+    _shared_data_deb(
+        first, package="relint", version="1.0.0", depends="libc6 (>= 2.31)",
+        data_tar=data_tar,
+    )
+    response = upload(test_client, [first])
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["reused_checksums"] == []
+    assert calls["count"] == 1
+
+    # Second upload: identical data archive, new Version and Depends. Control
+    # inspection still runs (format/arch/duplicate checks are unchanged), but
+    # the data archive must not be decompressed again.
+    second = src / "relint_2.0.0_amd64.deb"
+    _shared_data_deb(
+        second, package="relint", version="2.0.0",
+        depends="libc6 (>= 2.34), libfoo | libbar", data_tar=data_tar,
+    )
+    response = upload(test_client, [second])
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["reused_checksums"] == [
+        {"package": "relint", "version": "2.0.0"}
+    ]
+    assert calls["count"] == 1  # still only the first package was fully validated
+
+    # The new index must carry the new version/depends, and the downloaded
+    # package's whole-file SHA-256 must match the index.
+    index = test_client.get("/dists/stable/main/binary-amd64/Packages.gz").content
+    entries = packages_entries(index)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["Package"] == "relint"
+    assert entry["Version"] == "2.0.0"
+    assert entry["Depends"] == "libc6 (>= 2.34), libfoo | libbar"
+    downloaded = test_client.get(f"/{entry['Filename']}")
+    assert downloaded.status_code == 200
+    assert sha256(downloaded.content) == entry["SHA256"]
+    assert int(entry["Size"]) == len(downloaded.content) == second.stat().st_size
+
+
+def test_two_packages_in_one_batch_reuse_the_same_data_archive(client):
+    test_client, settings = client
+    src = settings.data_dir.parent / "src"
+    data_tar = make_data_tar()
+
+    # Prime the cache with the shared data archive.
+    prime = src / "prime_1.0.0_amd64.deb"
+    _shared_data_deb(
+        prime, package="prime", version="1.0.0", depends=None, data_tar=data_tar
+    )
+    assert upload(test_client, [prime]).status_code == 201
+
+    # A batch of two different packages (different name/version/depends) whose
+    # data archive bytes are identical must reuse the record for both.
+    a = src / "reuse-a_3.1.0_amd64.deb"
+    b = src / "reuse-b_4.2.0_amd64.deb"
+    _shared_data_deb(
+        a, package="reuse-a", version="3.1.0", depends="libc6", data_tar=data_tar
+    )
+    _shared_data_deb(
+        b, package="reuse-b", version="4.2.0", depends="zlib1g, libc6",
+        data_tar=data_tar,
+    )
+    response = upload(test_client, [a, b])
+    assert response.status_code == 201, response.text
+    reused = sorted(
+        (item["package"], item["version"])
+        for item in response.json()["reused_checksums"]
+    )
+    assert reused == [("reuse-a", "3.1.0"), ("reuse-b", "4.2.0")]
+
+    index = test_client.get("/dists/stable/main/binary-amd64/Packages.gz").content
+    entries = {e["Package"]: e for e in packages_entries(index)}
+    assert set(entries) == {"reuse-a", "reuse-b"}
+    assert entries["reuse-a"]["Version"] == "3.1.0"
+    assert entries["reuse-a"]["Depends"] == "libc6"
+    assert entries["reuse-b"]["Version"] == "4.2.0"
+    assert entries["reuse-b"]["Depends"] == "zlib1g, libc6"
+    for entry in entries.values():
+        package = test_client.get(f"/{entry['Filename']}")
+        assert sha256(package.content) == entry["SHA256"]
+
+
+def test_validation_record_survives_gc_and_restart(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    repo = Repository(settings)
+    src = tmp_path / "src"
+    src.mkdir()
+    data_tar = make_data_tar()
+
+    first = src / "ever_1.0.0_amd64.deb"
+    _shared_data_deb(
+        first, package="ever", version="1.0.0", depends="libc6", data_tar=data_tar
+    )
+    first_digest = deb_archive_sha256(first)
+    publication, reused = repo.publish(
+        [StagedUpload(path=first, original_name=first.name)]
+    )
+    assert publication.state == "committed"
+    assert reused == ()
+
+    # Evict the original package from the pool through further publications:
+    # retention is 2, so three later releases remove release 1's files.
+    for version in ("2.0.0", "3.0.0", "4.0.0"):
+        other = src / f"other_{version}_amd64.deb"
+        build_deb(
+            other,
+            control={"Package": "other", "Version": version},
+            payload=version.encode(),
+        )
+        repo.publish([StagedUpload(path=other, original_name=other.name)])
+
+    pool = list((repo.export / "pool").rglob("*.deb"))
+    assert all("ever" not in str(path) for path in pool)
+
+    # A brand new process (new Repository instance, same sqlite journal) must
+    # still recognise the data archive even though the package was collected.
+    reloaded = Repository(settings)
+    assert reloaded.find_validated("data.tar.gz", first_digest)
+
+    validate_calls = {"count": 0}
+    original_validate = debmod._validate_payload
+
+    def counting_validate(*args, **kwargs):
+        validate_calls["count"] += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(debmod, "_validate_payload", counting_validate)
+    rebuilt = src / "ever_5.0.0_amd64.deb"
+    _shared_data_deb(
+        rebuilt, package="ever", version="5.0.0", depends="libc6, libnew",
+        data_tar=data_tar,
+    )
+    publication, reused = reloaded.publish(
+        [StagedUpload(path=rebuilt, original_name=rebuilt.name)]
+    )
+    assert publication.state == "committed"
+    assert reused == (("ever", "5.0.0"),)
+    assert validate_calls["count"] == 0
+
+
+def test_interrupted_publication_leaves_no_reusable_record(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    repo = Repository(settings)
+    src = tmp_path / "src"
+    src.mkdir()
+    data_tar = make_data_tar()
+
+    # A publication that dies at the Release commit point must not grant reuse.
+    original = storage.atomic_write
+
+    def exploding(target: Path, data: bytes) -> None:
+        if target.name == "Release":
+            raise OSError("disk full")
+        original(target, data)
+
+    doomed = src / "doomed_1.0.0_amd64.deb"
+    _shared_data_deb(
+        doomed, package="doomed", version="1.0.0", depends="libc6",
+        data_tar=data_tar,
+    )
+    digest = deb_archive_sha256(doomed)
+    monkeypatch.setattr(storage, "atomic_write", exploding)
+    with pytest.raises(storage.PublicationError):
+        repo.publish([StagedUpload(path=doomed, original_name=doomed.name)])
+    monkeypatch.setattr(storage, "atomic_write", original)
+
+    assert repo.find_validated("data.tar.gz", digest) is False
+
+    # Simulate a service restart: reconcile marks the row aborted, and the
+    # validation record must stay invisible.
+    recovered = Repository(settings)
+    assert recovered.find_validated("data.tar.gz", digest) is False
+
+    # The same data archive in a later, successful publication is fully
+    # validated (no reuse from the aborted attempt) and then becomes reusable.
+    validate_calls = {"count": 0}
+    original_validate = debmod._validate_payload
+
+    def counting_validate(*args, **kwargs):
+        validate_calls["count"] += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(debmod, "_validate_payload", counting_validate)
+    good = src / "doomed_2.0.0_amd64.deb"
+    _shared_data_deb(
+        good, package="doomed", version="2.0.0", depends="libc6, libextra",
+        data_tar=data_tar,
+    )
+    publication, reused = recovered.publish(
+        [StagedUpload(path=good, original_name=good.name)]
+    )
+    assert publication.state == "committed"
+    assert reused == ()
+    assert validate_calls["count"] == 1
+    assert recovered.find_validated("data.tar.gz", digest) is True
+
+    # One more identical-archive upload now reuses the successful record.
+    again = src / "doomed_3.0.0_amd64.deb"
+    _shared_data_deb(
+        again, package="doomed", version="3.0.0", depends="libc6, libextra",
+        data_tar=data_tar,
+    )
+    publication, reused = recovered.publish(
+        [StagedUpload(path=again, original_name=again.name)]
+    )
+    assert reused == (("doomed", "3.0.0"),)
+    assert validate_calls["count"] == 1
+
+
+def test_recovered_successful_publication_makes_record_reusable(tmp_path):
+    """A staged publication reconciled as committed (rename happened) leaves
+    a reusable validation record after restart."""
+
+    settings = make_settings(tmp_path)
+    repo = Repository(settings)
+    src = tmp_path / "src"
+    src.mkdir()
+    data_tar = make_data_tar()
+    first = src / "crashy_1.0.0_amd64.deb"
+    _shared_data_deb(
+        first, package="crashy", version="1.0.0", depends="libc6",
+        data_tar=data_tar,
+    )
+    staged = [StagedUpload(path=first, original_name=first.name)]
+    prepared = repo._prepare(staged)
+
+    # Embed the checksum rows exactly as _commit would, then crash before the
+    # state flips to committed - but with the Release already renamed, which is
+    # reconcile()'s definition of a successful publication.
+    with repo._connect() as db:
+        cursor = db.execute(
+            "INSERT INTO publications (created_at, state, release_sha256, "
+            "index_sha256, plain_index_sha256, index_size, package_count, "
+            "packages_json) VALUES ('now', 'staged', ?, ?, ?, ?, ?, '[]')",
+            (
+                sha256(prepared.release),
+                prepared.index_sha256,
+                prepared.plain_index_sha256,
+                prepared.index_size,
+                len(prepared.pairs),
+            ),
+        )
+        staged_id = int(cursor.lastrowid)
+        repo._remember_validated(db, staged_id, "now", prepared.pairs)
+    repo.release_abspath.parent.mkdir(parents=True, exist_ok=True)
+    repo.release_abspath.write_bytes(prepared.release)
+
+    reloaded = Repository(settings)
+    digest = deb_archive_sha256(first)
+    assert reloaded.find_validated("data.tar.gz", digest) is True
+
+
+def test_corrupt_data_archive_is_rejected_even_with_same_control(client):
+    test_client, settings = client
+    good = settings.data_dir.parent / "good" / "z.deb"
+    build_deb(good, control={"Package": "corrupt2", "Version": "1.0"},
+              payload=b"A" * 100000)
+    assert upload(test_client, [good]).status_code == 201
+
+    # Reuse the validated data archive's compression/digest in name only:
+    # flip bytes inside the gzip stream. The cache lookup must miss because
+    # the raw digest changes, and full validation must reject the package.
+    blob = bytearray(good.read_bytes())
+    start = blob.find(b"\x1f\x8b\x08", 200)
+    assert start > 0
+    for offset in range(start + 30, start + 60):
+        blob[offset] ^= 0xFF
+    bad = settings.data_dir.parent / "bad" / "z.deb"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_bytes(blob)
+    response = upload(test_client, [bad])
+    assert response.status_code == 400
+    assert "corrupt" in response.text.lower() or "truncat" in response.text.lower()
+
+
+def test_different_compression_same_tar_does_not_reuse(tmp_path):
+    """The cache key includes the compression format: a data.tar.xz must not
+    be treated as validated because a data.tar.gz with the same tar contents
+    was seen earlier."""
+
+    import lzma
+
+    settings = make_settings(tmp_path)
+    repo = Repository(settings)
+    src = tmp_path / "src"
+    src.mkdir()
+    gz_archive = make_data_tar()
+    gz_deb = src / "comp_1.0.0_amd64.deb"
+    _shared_data_deb(
+        gz_deb, package="comp", version="1.0.0", depends=None, data_tar=gz_archive
+    )
+    publication, reused = repo.publish(
+        [StagedUpload(path=gz_deb, original_name=gz_deb.name)]
+    )
+    assert publication.state == "committed" and reused == ()
+
+    # Build the xz variant from the same uncompressed tar payload.
+    tar_blob = gzip.decompress(gz_archive)
+    xz_archive = lzma.compress(tar_blob)
+    xz_deb = src / "comp_2.0.0_amd64.deb"
+    build_deb(
+        xz_deb,
+        control={"Package": "comp", "Version": "2.0.0"},
+        data_tar=xz_archive,
+        data_member="data.tar.xz",
+    )
+    assert repo.find_validated("data.tar.xz", sha256(xz_archive)) is False
+    publication, reused = repo.publish(
+        [StagedUpload(path=xz_deb, original_name=xz_deb.name)]
+    )
+    assert publication.state == "committed"
+    assert reused == ()
+    assert repo.find_validated("data.tar.xz", sha256(xz_archive)) is True
+
+
+def deb_archive_sha256(deb_path: Path) -> str:
+    """Compute the raw data.tar member digest the way the server does."""
+
+    import io
+
+    from app.deb import _read_ar_index
+
+    size = deb_path.stat().st_size
+    with deb_path.open("rb") as fh:
+        entries = {
+            name: (offset, member_size)
+            for name, offset, member_size in _read_ar_index(
+                io.BufferedReader(fh), size
+            )
+        }
+    data_member = next(name for name in entries if name.startswith("data.tar"))
+    offset, member_size = entries[data_member]
+    return debmod.hash_raw_member(deb_path, offset, member_size)

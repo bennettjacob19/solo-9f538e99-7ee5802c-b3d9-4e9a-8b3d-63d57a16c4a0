@@ -11,7 +11,10 @@ Routes
 
 Every upload is written to a private intake directory, validated and hashed,
 and only then committed under a lock.  See :mod:`app.storage` for the
-transaction and recovery protocol.
+transaction and recovery protocol.  A successful publish response includes
+``reused_checksums``: the packages in the batch whose data archive integrity
+check was reused from an earlier committed publication instead of being
+decompressed and re-validated.
 """
 
 from __future__ import annotations
@@ -211,7 +214,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 staged.append(StagedUpload(path=target, original_name=name))
 
             try:
-                publication = repository.publish(staged)
+                publication, reused = repository.publish(staged)
             except PublicationError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         finally:
@@ -221,6 +224,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=201,
             content={
                 "published": publication.to_dict(),
+                "reused_checksums": [
+                    {"package": name, "version": version}
+                    for name, version in reused
+                ],
                 "release_url": f"/{settings.release_path}",
             },
         )

@@ -48,7 +48,16 @@ def build_deb(
     control: dict[str, str] | None = None,
     payload: bytes = b"payload\n",
     arch: str = "amd64",
+    data_tar: bytes | None = None,
+    data_member: str = "data.tar.gz",
 ) -> Path:
+    """Build a real ``.deb`` at *path*.
+
+    Passing an explicit *data_tar* lets several packages share byte-identical
+    data archives while their control files (Version, Depends, ...) differ,
+    which is exactly the case the validation cache is designed for.
+    """
+
     fields = dict(DEFAULT_CONTROL)
     fields["Architecture"] = arch
     if control:
@@ -57,16 +66,25 @@ def build_deb(
     control_tar = _tar_gz(
         {"control": control_text.encode(), "md5sums": b""}
     )
-    data_tar = _tar_gz(
-        {"usr/share/doc/demo/README": payload},
-    )
+    if data_tar is None:
+        data_tar = _tar_gz(
+            {"usr/share/doc/demo/README": payload},
+        )
     blob = _ar(
         [
             ("debian-binary", b"2.0\n"),
             ("control.tar.gz", control_tar),
-            ("data.tar.gz", data_tar),
+            (data_member, data_tar),
         ]
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(blob)
     return path
+
+
+def make_data_tar(members: dict[str, bytes] | None = None) -> bytes:
+    """Return a deterministic, gzip-compressed data archive for reuse."""
+
+    if members is None:
+        members = {"usr/share/doc/demo/README": b"shared payload\n"}
+    return _tar_gz(members)

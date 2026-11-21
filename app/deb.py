@@ -6,6 +6,16 @@ metadata and enough structural checks to reject corrupt files, therefore we
 parse the ``ar`` container and ``control.tar`` ourselves instead of trusting
 the uploaded filename or executing package maintainer scripts.
 
+Every inspection additionally hashes the raw bytes of the ``data.tar`` ar
+member in fixed-size chunks (without decompressing it).  The digest, paired
+with the member's compression format, identifies a data archive
+independently of control metadata: packages that only differ in fields such
+as Version or Depends carry byte-identical data archives.  When the caller
+supplies a :class:`DataValidationCache` holding a record left by an earlier
+*committed* publication for that pair, the full decompression/tar walk is
+skipped; otherwise the payload is fully validated and the caller persists the
+digest once the publication commits.
+
 Supported control compression: none, gzip, xz, bzip2 and zstd.  zstd support
 uses the optional :mod:`zstandard` module; when it is unavailable we fall back
 to ``dpkg-deb`` if present, and otherwise reject the package with a clear
@@ -16,14 +26,16 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import hashlib
 import io
 import lzma
 import re
 import shutil
 import subprocess
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Protocol
 
 try:  # pragma: no cover - exercised indirectly when wheels are installed
     import zstandard
@@ -41,6 +53,8 @@ MAX_FIELD_LENGTH = 4096
 MAX_VERSION_LENGTH = 128
 #: Upper bound for the uncompressed data archive, matching the upload limit.
 _MAX_PAYLOAD_BYTES = 2 * 1024 * 1024 * 1024
+#: Read size for streaming the (potentially large) data archive member.
+_CHUNK = 1024 * 1024
 
 #: Fields copied verbatim from the control file into the Packages index.
 COPIED_FIELDS = (
@@ -72,11 +86,42 @@ class DebError(ValueError):
 
 
 @dataclass(frozen=True)
+class DataArchiveInfo:
+    """Identity of a package's data archive, independent of control metadata.
+
+    ``compression`` is the exact ar member name (``data.tar.gz``,
+    ``data.tar.xz`` ...) and ``sha256`` is the digest of the *raw, still
+    compressed* member bytes.  Two packages that only differ in control
+    fields (e.g. Depends/Version) carry byte-identical data archives and
+    therefore share this identity.
+    """
+
+    compression: str
+    sha256: str
+
+
+class DataValidationCache(Protocol):
+    """Persistent record of data archives already validated by a *committed*
+    publication.
+
+    A hit proves the exact raw bytes were decompressed and walked end to end
+    during an earlier successful publication, so the expensive check can be
+    skipped.  Implementations must never answer positively for archives that
+    were only seen by interrupted/aborted publications.
+    """
+
+    def find_validated(self, compression: str, sha256: str) -> bool:
+        ...
+
+
+@dataclass(frozen=True)
 class DebInfo:
     package: str
     version: str
     architecture: str
     fields: tuple[tuple[str, str], ...]
+    data_archive: DataArchiveInfo | None = None
+    data_validation_reused: bool = False
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -152,6 +197,31 @@ def _read_member(fh: io.BufferedIOBase, offset: int, size: int, limit: int, what
     if len(data) != size:
         raise DebError(f"not a Debian package: truncated {what}")
     return data
+
+
+def hash_raw_member(path: Path, offset: int, size: int) -> str:
+    """SHA-256 of a raw ar member, streamed in fixed-size chunks.
+
+    The data archive is hashed *before* any decompression: the digest covers
+    the exact bytes stored inside the uploaded ``.deb`` and therefore stays
+    stable across packages whose control archive differs while the data
+    archive was rebuilt byte for byte.
+    """
+
+    digest = hashlib.sha256()
+    remaining = size
+    try:
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            while remaining > 0:
+                chunk = fh.read(min(_CHUNK, remaining))
+                if not chunk:
+                    raise DebError("not a Debian package: truncated data archive")
+                digest.update(chunk)
+                remaining -= len(chunk)
+    except OSError as exc:
+        raise DebError(f"cannot read uploaded package: {exc}") from exc
+    return digest.hexdigest()
 
 
 class _SliceReader(io.RawIOBase):
@@ -420,8 +490,20 @@ def _inspect_via_dpkg_deb(path: Path, expected_arch: str) -> DebInfo | None:
     return _validate_fields(fields, expected_arch)
 
 
-def inspect_deb(path: Path, expected_arch: str) -> DebInfo:
-    """Validate *path* as an ``.deb`` for *expected_arch* and return metadata."""
+def inspect_deb(
+    path: Path,
+    expected_arch: str,
+    cache: DataValidationCache | None = None,
+) -> DebInfo:
+    """Validate *path* as an ``.deb`` for *expected_arch* and return metadata.
+
+    The data archive's raw bytes are always hashed in chunks.  When *cache*
+    already holds a validation record for the same compression format and
+    digest (left behind by an earlier *committed* publication), the expensive
+    decompression and tar walk are skipped; otherwise the payload is fully
+    validated and the caller is expected to remember the digest once the
+    publication commits.
+    """
 
     try:
         size = path.stat().st_size
@@ -470,8 +552,17 @@ def inspect_deb(path: Path, expected_arch: str) -> DebInfo:
         else:
             raise
 
-    _validate_payload(path, data_offset, data_size, data_member, _MAX_PAYLOAD_BYTES)
-    return info
+    # Hash the compressed member bytes first; this digest is the cache key
+    # and remains valid even when the full validation below is skipped.
+    data_digest = hash_raw_member(path, data_offset, data_size)
+    data_info = DataArchiveInfo(compression=data_member, sha256=data_digest)
+    reused = cache is not None and cache.find_validated(data_member, data_digest)
+    if not reused:
+        # Cache miss: prove the archive decompresses and is a complete tar.
+        _validate_payload(path, data_offset, data_size, data_member, _MAX_PAYLOAD_BYTES)
+    return replace(
+        info, data_archive=data_info, data_validation_reused=reused
+    )
 
 
 def _inspect_control(raw_control: bytes, control_member: str, expected_arch: str) -> DebInfo:

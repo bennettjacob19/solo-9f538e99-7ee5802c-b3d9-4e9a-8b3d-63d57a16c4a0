@@ -91,4 +91,45 @@ curl -fsS -o /dev/null "$REPO_URL/dists/stable/main/binary-amd64/by-hash/SHA256/
 curl -fsS -o /dev/null "$REPO_URL/dists/stable/main/binary-amd64/by-hash/SHA256/$IDX3"
 echo "== retention keeps exactly the two most recent releases"
 
+# Validation-result reuse: two packages with byte-identical data archives but
+# different Version/Depends. The first upload validates the data archive; the
+# second must reuse the record even though the whole-package bytes differ.
+REUSE_DIR="$WORK/reuse"
+REUSE_A="$REUSE_DIR/reusepkg_1.0.0_amd64.deb"
+REUSE_B="$REUSE_DIR/reusepkg_4.0.0_amd64.deb"
+python3 "$(dirname "$0")/build_reuse_debs.py" "$REUSE_DIR" reusepkg 1.0.0 4.0.0 >/dev/null
+# Sanity: the data.tar.gz members are byte identical while the packages are not.
+data_member_sha() {
+  ar t "$1" >/dev/null 2>&1 || { echo "ar tool missing" >&2; exit 1; }
+  ar p "$1" data.tar.gz | sha256sum | cut -d' ' -f1
+}
+test "$(data_member_sha "$REUSE_A")" = "$(data_member_sha "$REUSE_B")"
+test "$(sha256sum "$REUSE_A" | cut -d' ' -f1)" != "$(sha256sum "$REUSE_B" | cut -d' ' -f1)"
+
+resp1=$(curl -fsS -X POST "$REPO_URL/api/publish" -F "files=@$REUSE_A")
+echo "$resp1" | grep -q '"reused_checksums":\[\]'
+echo "== first reuse candidate fully validated (no reusable record yet)"
+
+resp2=$(curl -fsS -X POST "$REPO_URL/api/publish" -F "files=@$REUSE_B")
+echo "$resp2" | grep -q '"package":"reusepkg"'
+echo "$resp2" | grep -q '"version":"4.0.0"'
+echo "== second upload reports reused validation result for reusepkg 4.0.0"
+
+# The new index must advertise the new version and dependency.
+curl -fsS "$REPO_URL/dists/stable/main/binary-amd64/Packages.gz" \
+  | gzip -dc > "$WORK/Packages.reuse"
+stanza=$(awk 'BEGIN{RS=""} index($0, "Package: reusepkg\n") == 1' "$WORK/Packages.reuse")
+echo "$stanza" | grep -q '^Version: 4.0.0$'
+echo "$stanza" | grep -q '^Depends: libc6 (>= 2.34), libfoo | libbar$'
+echo "== index advertises the reused package's new version and Depends"
+
+# Download the whole package and verify its full-file SHA-256 against index.
+reuse_filename=$(echo "$stanza" | sed -n 's/^Filename: //p')
+reuse_sha=$(echo "$stanza" | sed -n 's/^SHA256: //p')
+reuse_size=$(echo "$stanza" | sed -n 's/^Size: //p')
+curl -fsS "$REPO_URL/$reuse_filename" -o "$WORK/reuse-download.deb"
+echo "$reuse_sha  $WORK/reuse-download.deb" | sha256sum -c - >/dev/null
+test "$(stat -c %s "$WORK/reuse-download.deb")" = "$reuse_size"
+echo "== downloaded package whole-file SHA-256 and size match the index"
+
 echo "== OK"

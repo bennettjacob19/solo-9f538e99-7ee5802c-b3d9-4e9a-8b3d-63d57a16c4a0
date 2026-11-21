@@ -29,6 +29,17 @@ the hash recorded in the row: equal means the final rename happened and the
 publication is committed, otherwise it is aborted and its files are collected.
 Because the previous committed publications are never modified, the last two
 releases remain fully usable after any interruption.
+
+Data validation cache
+---------------------
+The ``data_checksums`` table maps ``(data member compression, raw SHA-256 of
+the data.tar member)`` to the publication that validated those bytes by
+decompressing and walking the whole archive.  Rows are written while the
+publication is ``staged`` but only become visible through
+:meth:`Repository.find_validated` once the publication is ``committed`` (also
+after crash recovery), so interrupted publications never grant reuse.  The
+table is not touched by garbage collection: validation records stay reusable
+after the originating pool file was reclaimed and across service restarts.
 """
 
 from __future__ import annotations
@@ -86,6 +97,9 @@ class PreparedPublication:
     plain_index_sha256: str
     plain_index_size: int
     uploads: dict[str, StagedUpload]
+    #: ``(package, version)`` pairs whose data archive validation was reused
+    #: from an earlier committed publication.
+    reused: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -215,6 +229,15 @@ class Repository:
                     role TEXT NOT NULL,
                     PRIMARY KEY (publication_id, path)
                 );
+                CREATE TABLE IF NOT EXISTS data_checksums (
+                    compression TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    publication_id INTEGER NOT NULL REFERENCES publications(id),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (compression, sha256)
+                );
+                CREATE INDEX IF NOT EXISTS idx_data_checksums_publication
+                    ON data_checksums(publication_id);
                 """
             )
         self.reconcile()
@@ -280,14 +303,89 @@ class Repository:
             ).fetchone()
         return self._row_to_publication(row) if row else None
 
+    # ------------------------------------------------- data validation cache
+    def find_validated(self, compression: str, digest: str) -> bool:
+        """Return True when a *committed* publication validated this exact
+        ``(compression, raw data archive sha256)`` pair.
+
+        Records owned by ``staged`` or ``aborted`` publications never match:
+        an interrupted publication must not leave reusable validation
+        results, and the join also makes the rows survive garbage collection
+        of the packages themselves and full service restarts.
+        """
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM data_checksums c "
+                "JOIN publications p ON p.id = c.publication_id "
+                "WHERE c.compression = ? AND c.sha256 = ? AND p.state = 'committed' "
+                "LIMIT 1",
+                (compression, digest),
+            ).fetchone()
+        return row is not None
+
+    def _remember_validated(
+        self, db: sqlite3.Connection, publication_id: int, created_at: str,
+        pairs: tuple[tuple[DebInfo, PackageEntry], ...],
+    ) -> None:
+        """Record every freshly validated data archive of this publication.
+
+        Rows are written while the publication is still ``staged`` and only
+        become visible through :meth:`find_validated` once the publication
+        commits.  If an earlier, since-aborted publication already stored the
+        same key (the commit never happened), the row is rebound to this
+        publication; rows owned by a committed publication are immutable.
+        """
+
+        rows = []
+        seen: set[tuple[str, str]] = set()
+        for info, _entry in pairs:
+            if info.data_archive is None or info.data_validation_reused:
+                continue
+            key = (info.data_archive.compression, info.data_archive.sha256)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((key[0], key[1], publication_id, created_at))
+        if not rows:
+            return
+        # Rows owned by committed publications are immutable, so an existing
+        # key is simply ignored.  A key owned by a non-committed publication
+        # comes from an interrupted earlier attempt: rebound it here, and it
+        # becomes reusable as soon as *this* publication commits.
+        db.executemany(
+            "INSERT OR IGNORE INTO data_checksums (compression, sha256, "
+            "publication_id, created_at) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        db.executemany(
+            "UPDATE data_checksums SET publication_id = ?, created_at = ? "
+            "WHERE compression = ? AND sha256 = ? AND publication_id IN "
+            "(SELECT id FROM publications WHERE state != 'committed')",
+            [
+                (publication_id, created_at, compression, digest)
+                for compression, digest, publication_id, created_at in rows
+            ],
+        )
+
     # ------------------------------------------------------------- publishing
-    def publish(self, uploads: list[StagedUpload]) -> Publication:
+    def publish(
+        self, uploads: list[StagedUpload]
+    ) -> tuple[Publication, tuple[tuple[str, str], ...]]:
+        """Validate and publish *uploads*.
+
+        Returns the :class:`Publication` together with the
+        ``(package, version)`` pairs whose data archive integrity check was
+        reused from a previously committed publication.
+        """
+
         if not uploads:
             raise PublicationError("a publication must contain at least one package")
 
         prepared = self._prepare(uploads)
         with self._exclusive():
-            return self._commit(prepared)
+            publication = self._commit(prepared)
+        return publication, prepared.reused
 
     def _prepare(self, uploads: list[StagedUpload]) -> PreparedPublication:
         """Validate/hash the batch and build the new index and Release bytes."""
@@ -296,14 +394,19 @@ class Repository:
         seen_identity: dict[tuple[str, str, str], str] = {}
         seen_path: dict[str, str] = {}
         uploads_by_dest: dict[str, StagedUpload] = {}
+        reused: list[tuple[str, str]] = []
 
         for upload in uploads:
             try:
-                info = inspect_deb(upload.path, self.settings.architecture)
+                info = inspect_deb(
+                    upload.path, self.settings.architecture, cache=self
+                )
             except DebError as exc:
                 raise PublicationError(
                     f"{upload.original_name}: {exc}"
                 ) from exc
+            if info.data_validation_reused:
+                reused.append((info.package, info.version))
             digest = sha256_file(upload.path)
             size = upload.path.stat().st_size
             filename = pool_filename(self.settings.component, info, digest)
@@ -361,6 +464,7 @@ class Repository:
             plain_index_sha256=plain_sha,
             plain_index_size=len(index),
             uploads=uploads_by_dest,
+            reused=tuple(reused),
         )
 
     def _file_plan(self, prepared: PreparedPublication) -> list[tuple[str, str]]:
@@ -417,6 +521,12 @@ class Repository:
                 "VALUES (?, ?, ?)",
                 [(publication_id, path, role) for path, role in plan],
             )
+            # Remember freshly validated data archives now.  The rows are not
+            # reusable until this publication reaches 'committed'; if the
+            # commit below fails, the publication (and these rows) stay
+            # invisible to find_validated() and are rebound or superseded by
+            # a later successful publication.
+            self._remember_validated(db, publication_id, created_at, pairs)
 
         try:
             # 1. Immutable, content-addressed payload and by-hash indexes.
